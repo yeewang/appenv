@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in real-app test. Opens four disposable windows; never uses default profiles."""
+"""Opt-in real-app test. Opens disposable instances; never uses default profiles."""
 import argparse
 import json
 import os
@@ -11,8 +11,10 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--cli", type=Path, required=True)
 parser.add_argument("--run-apps", action="store_true", required=True)
+parser.add_argument("--apps", nargs="+", choices=["chrome", "vscode", "codex"], default=["chrome", "vscode"])
 args = parser.parse_args()
 cli = str(args.cli.resolve())
+apps = list(dict.fromkeys(args.apps))
 
 with tempfile.TemporaryDirectory(prefix="AppEnv-Integration-") as scratch:
     root = Path(scratch) / "storage"
@@ -36,17 +38,24 @@ with tempfile.TemporaryDirectory(prefix="AppEnv-Integration-") as scratch:
     try:
         for name in names:
             run("create", name)
-            for app in ["chrome", "vscode"]:
+            for app in apps:
                 print(run("run", "--env", name, "--app", app), flush=True)
         live = state()
         first, second = pids(live[names[0]]), pids(live[names[1]])
-        assert len(set(first.values()) | set(second.values())) == 4
+        assert len(set(first.values()) | set(second.values())) == len(apps) * 2
+        if "codex" in apps:
+            for item in live.values():
+                data = root / "environments" / item["id"] / "apps" / "com.openai.codex"
+                assert (data / "codex-home" / ".codex-global-state.json").is_file()
+                assert (data / "user-data" / "Local State").is_file()
+                assert not (data / "codex-home" / "auth.json").exists(), "Fresh test profiles must not inherit credentials"
+            print("PASS: Codex backend and desktop state initialized in separate fresh profiles", flush=True)
         run("duplicate", names[0], "Must Fail", ok=False)
         run("delete", names[0], "--yes", ok=False)
-        for app in ["chrome", "vscode"]:
+        for app in apps:
             run("run", "--env", names[0], "--app", app)
         assert pids(state()[names[0]]) == first, "Reopening must reuse the same instance"
-        print("PASS: four distinct instances; focus reuses instances; running data protected", flush=True)
+        print(f"PASS: {len(apps) * 2} distinct instances; focus reuses instances; running data protected", flush=True)
 
         registry_file = root / "registry.json"
         registry = json.loads(registry_file.read_text())
@@ -67,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix="AppEnv-Integration-") as scratch:
         source_path = Path(run("path", names[0]))
         sentinel = source_path / "persistence-test.txt"
         sentinel.write_text("persistent")
-        for app in ["chrome", "vscode"]:
+        for app in apps:
             run("run", "--env", names[0], "--app", app)
         assert sentinel.read_text() == "persistent"
         run("stop", names[0])

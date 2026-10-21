@@ -95,12 +95,47 @@ public final class Store {
             }
         }
     }
+    /// Validate the entire drop before changing any bindings. Dropping an existing
+    /// binding is a no-op, including when that app is already running.
+    @discardableResult public func addApplicationFiles(_ selector: String, urls: [URL]) throws -> Int {
+        guard !urls.isEmpty else { throw AppEnvError("Drop an application from Finder.") }
+        var bindings: [AppBinding] = []
+        for url in urls {
+            guard url.isFileURL, url.pathExtension.lowercased() == "app",
+                  let bundle = Bundle(url: url) else {
+                throw AppEnvError("Drop .app applications from Finder, not documents or web links.")
+            }
+            guard let adapter = Adapter.allCases.first(where: { $0.bundleID == bundle.bundleIdentifier }) else {
+                throw AppEnvError("\(url.lastPathComponent) is not supported yet. AppEnv currently supports \(Adapter.supportedNames). No apps from this drop were added.")
+            }
+            _ = try validateApplication(adapter, url)
+            bindings.append(AppBinding(adapter: adapter, path: url.standardizedFileURL.path))
+        }
+        return try transaction { registry in
+            let i = try index(registry, selector)
+            var count = 0
+            for binding in bindings {
+                if let j = registry.environments[i].apps.firstIndex(where: { $0.adapter == binding.adapter }) {
+                    if registry.environments[i].apps[j].path == binding.path { continue }
+                    guard registry.environments[i].apps[j].instance == nil else {
+                        throw AppEnvError("Stop \(binding.adapter.name) before changing its location. No apps from this drop were added.")
+                    }
+                    registry.environments[i].apps[j].path = binding.path
+                } else {
+                    registry.environments[i].apps.append(binding)
+                }
+                count += 1
+            }
+            return count
+        }
+    }
     @discardableResult public func duplicate(_ selector: String, name: String) throws -> Environment {
         try transaction { registry in
             let source = registry.environments[try index(registry, selector)]
-            guard !source.isRunning else { throw AppEnvError("Stop all apps before duplicating this environment.") }
+            try ensureStopped(source)
             let copy = Environment(name: try validateName(name, registry), apps: source.apps)
-            try fm.copyItem(at: directory(source.id), to: directory(copy.id))
+            do { try copyProfile(from: directory(source.id), to: directory(copy.id)) }
+            catch { try? fm.removeItem(at: directory(copy.id)); throw error }
             registry.environments.append(copy)
             return copy
         }
@@ -108,7 +143,7 @@ public final class Store {
     public func delete(_ selector: String) throws {
         try transaction { registry in
             let i = try index(registry, selector)
-            guard !registry.environments[i].isRunning else { throw AppEnvError("Stop all apps before deleting this environment.") }
+            try ensureStopped(registry.environments[i])
             // A recoverable trash move, never recursive deletion of a user-supplied path.
             try fm.trashItem(at: directory(registry.environments[i].id), resultingItemURL: nil)
             registry.environments.remove(at: i)
@@ -118,7 +153,7 @@ public final class Store {
         let fd = try lock(); defer { unlock(fd) }
         var registry = try read(); reconcile(&registry)
         let env = registry.environments[try index(registry, selector)]
-        guard !env.isRunning else { throw AppEnvError("Stop all apps before exporting this environment.") }
+        try ensureStopped(env)
         guard !fm.fileExists(atPath: destination.path) else { throw AppEnvError("The export destination already exists.") }
         guard !destination.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/") else {
             throw AppEnvError("Export to a folder outside AppEnv storage.")
@@ -126,7 +161,7 @@ public final class Store {
         let staging = fm.temporaryDirectory.appendingPathComponent("AppEnv-\(UUID().uuidString)")
         try fm.createDirectory(at: staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? fm.removeItem(at: staging) }
-        try fm.copyItem(at: directory(env.id), to: staging.appendingPathComponent("data"))
+        try copyProfile(from: directory(env.id), to: staging.appendingPathComponent("data"))
         try JSONEncoder().encode(env).write(to: staging.appendingPathComponent("environment.json"))
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
         process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", staging.path, destination.path]
@@ -135,11 +170,72 @@ public final class Store {
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
     }
 
+    /// Runtime sockets and FIFOs are recreated by their owning app. They are not
+    /// persistent profile data and cannot be copied into a backup or a new profile.
+    private func copyProfile(from source: URL, to destination: URL) throws {
+        let attributes = try fm.attributesOfItem(atPath: source.path)
+        switch attributes[.type] as? FileAttributeType {
+        case .typeDirectory:
+            try fm.createDirectory(at: destination, withIntermediateDirectories: false,
+                                   attributes: [.posixPermissions: attributes[.posixPermissions] ?? 0o700])
+            for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+                try copyProfile(from: child, to: destination.appendingPathComponent(child.lastPathComponent))
+            }
+        case .typeRegular, .typeSymbolicLink:
+            try fm.copyItem(at: source, to: destination)
+        case .typeSocket, .typeUnknown, .typeCharacterSpecial, .typeBlockSpecial:
+            break
+        default:
+            break // Includes FIFOs, which Foundation reports as an unrecognized file type.
+        }
+    }
+
     private func running(_ instance: Instance) -> NSRunningApplication? {
         guard let app = NSRunningApplication(processIdentifier: instance.pid), !app.isTerminated,
               let date = app.launchDate, abs(date.timeIntervalSince(instance.launchedAt)) < 0.01,
               app.executableURL?.path == instance.executablePath else { return nil }
         return app
+    }
+    private func ensureStopped(_ environment: Environment) throws {
+        guard !environment.isRunning else { throw AppEnvError("Stop all apps before copying, exporting, or deleting this environment.") }
+        for binding in environment.apps where binding.adapter == .codex {
+            guard codexHelpers(binding, data: appDirectory(environment.id, .codex)).isEmpty else {
+                throw AppEnvError("Codex background processes still use this environment. Use Stop All before copying, exporting, or deleting it.")
+            }
+        }
+    }
+    private func codexHelpers(_ binding: AppBinding, data: URL) -> [Int32] {
+        let capacity = Int(proc_listallpids(nil, 0)) + 256
+        guard capacity > 256 else { return [] }
+        var pids = [Int32](repeating: 0, count: capacity)
+        let count = proc_listallpids(&pids, Int32(capacity * MemoryLayout<Int32>.size))
+        guard count > 0 else { return [] }
+        let expected = Adapter.codex.environment(data: launchDirectory(.codex, data))
+        return pids.prefix(min(Int(count), capacity)).filter { pid in
+            guard pid > 0 else { return false }
+            var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+            guard proc_pidpath(pid, &path, UInt32(path.count)) > 0,
+                  String(cString: path).hasPrefix(binding.path + "/Contents/") else { return false }
+            let info = processLaunchInfo(pid)
+            return expected.allSatisfy { info.environment[$0.key] == $0.value }
+        }
+    }
+    @MainActor private func stopCodexHelpers(_ bindings: [AppBinding], environmentID: UUID, force: Bool) async throws {
+        for binding in bindings where binding.adapter == .codex {
+            let data = appDirectory(environmentID, .codex)
+            for pid in codexHelpers(binding, data: data) {
+                // Revalidate ownership immediately before signaling. Default Codex,
+                // another environment, and programs outside this app bundle are excluded.
+                if codexHelpers(binding, data: data).contains(pid) { _ = kill(pid, force ? SIGKILL : SIGTERM) }
+            }
+            for _ in 0..<40 {
+                if codexHelpers(binding, data: data).isEmpty { break }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard codexHelpers(binding, data: data).isEmpty else {
+                throw AppEnvError("Codex background processes have not stopped. Use Force Stop before backing up this environment.")
+            }
+        }
     }
     private func reconcile(_ registry: inout Registry) {
         let applications = NSWorkspace.shared.runningApplications
@@ -163,19 +259,26 @@ public final class Store {
         }
     }
     private func matchesProfile(_ pid: Int32, _ adapter: Adapter, _ data: URL) -> Bool {
-        let args = processArguments(pid)
-        let expected = adapter.arguments(data: launchDirectory(adapter, data))
+        let process = processLaunchInfo(pid)
+        return matchesProfile(arguments: process.arguments, environment: process.environment, adapter: adapter, data: data)
+    }
+    func matchesProfile(arguments args: [String], environment: [String: String], adapter: Adapter, data: URL) -> Bool {
+        let launchData = launchDirectory(adapter, data)
+        let expected = adapter.arguments(data: launchData)
+        if adapter == .codex {
+            return args.contains(expected[0]) && adapter.environment(data: launchData).allSatisfy { environment[$0.key] == $0.value }
+        }
         if adapter == .chrome { return args.contains(expected[0]) }
         guard let i = args.firstIndex(of: "--user-data-dir"), i + 1 < args.count else { return false }
         return args[i + 1] == expected[1]
     }
     private var aliasRoot: URL { URL(fileURLWithPath: "/tmp/appenv-\(getuid())") }
     func launchDirectory(_ adapter: Adapter, _ data: URL) -> URL {
-        guard adapter == .vscode else { return data }
+        guard adapter == .vscode || adapter == .codex else { return data }
         let digest = SHA256.hash(data: Data(data.path.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
         return aliasRoot.appendingPathComponent(digest)
     }
-    func prepareLaunchAlias(_ data: URL) throws {
+    func prepareLaunchAlias(_ data: URL, adapter: Adapter = .vscode) throws {
         // VS Code puts its main IPC socket under user-data; macOS limits socket
         // paths to 103 bytes. A private short alias keeps persistent data in AppEnv.
         if !fm.fileExists(atPath: aliasRoot.path) {
@@ -187,21 +290,21 @@ public final class Store {
               (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700 else {
             throw AppEnvError("The AppEnv runtime directory must be a private directory owned by you: \(aliasRoot.path)")
         }
-        let link = launchDirectory(.vscode, data)
+        let link = launchDirectory(adapter, data)
         if let target = try? fm.destinationOfSymbolicLink(atPath: link.path) {
-            guard target == data.path else { throw AppEnvError("The VS Code runtime alias points to an unexpected location.") }
+            guard target == data.path else { throw AppEnvError("The app runtime alias points to an unexpected location.") }
         } else {
             try fm.createSymbolicLink(atPath: link.path, withDestinationPath: data.path)
         }
     }
-    private func processArguments(_ pid: Int32) -> [String] {
+    private func processLaunchInfo(_ pid: Int32) -> (arguments: [String], environment: [String: String]) {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
-        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return ([], [:]) }
         var bytes = [UInt8](repeating: 0, count: size)
-        guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0 else { return [] }
+        guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0 else { return ([], [:]) }
         let argc = bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
-        guard argc > 0, argc < 100_000 else { return [] }
+        guard argc > 0, argc < 100_000 else { return ([], [:]) }
         var offset = 4
         while offset < size && bytes[offset] != 0 { offset += 1 }
         while offset < size && bytes[offset] == 0 { offset += 1 }
@@ -209,10 +312,24 @@ public final class Store {
         for _ in 0..<argc {
             let start = offset
             while offset < size && bytes[offset] != 0 { offset += 1 }
-            guard offset < size else { return [] }
+            guard offset < size else { return ([], [:]) }
             result.append(String(decoding: bytes[start..<offset], as: UTF8.self)); offset += 1
         }
-        return result
+        var environment: [String: String] = [:]
+        while offset < size && bytes[offset] != 0 {
+            let start = offset
+            while offset < size && bytes[offset] != 0 { offset += 1 }
+            let entry = String(decoding: bytes[start..<offset], as: UTF8.self)
+            if let separator = entry.firstIndex(of: "=") {
+                let key = String(entry[..<separator])
+                // Retain only the two profile identity variables, never authentication values.
+                if key == "CODEX_HOME" || key == "CODEX_ELECTRON_USER_DATA_PATH" {
+                    environment[key] = String(entry[entry.index(after: separator)...])
+                }
+            }
+            offset += 1
+        }
+        return (result, environment)
     }
     private func validateApplication(_ adapter: Adapter, _ url: URL) throws -> String {
         guard let bundle = Bundle(url: url), bundle.bundleIdentifier == adapter.bundleID else {
@@ -245,6 +362,7 @@ public final class Store {
         if let instance = binding.instance, let app = running(instance) {
             app.activate(options: []); return instance
         }
+        if adapter == .codex { try await stopCodexHelpers([binding], environmentID: registry.environments[i].id, force: false) }
         let url = URL(fileURLWithPath: binding.path)
         let version = try validateApplication(adapter, url)
         if let previous = binding.lastVersion, previous != version, !allowVersionChange {
@@ -255,8 +373,15 @@ public final class Store {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
         configuration.allowsRunningApplicationSubstitution = false
-        if adapter == .vscode { try prepareLaunchAlias(data) }
-        configuration.arguments = adapter.arguments(data: launchDirectory(adapter, data))
+        if adapter == .vscode || adapter == .codex { try prepareLaunchAlias(data, adapter: adapter) }
+        if adapter == .codex {
+            // Start fresh. Never copy the default ~/.codex config, sessions, or credentials.
+            for component in ["codex-home", "user-data"] {
+                try fm.createDirectory(at: data.appendingPathComponent(component), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            }
+        }
+        let launchData = launchDirectory(adapter, data)
+        configuration.arguments = adapter.arguments(data: launchData)
         // NSWorkspace treats this as the launch environment, not just an overlay.
         // Supply essential user variables without forwarding editor IPC hooks or tool secrets.
         configuration.environment = [
@@ -269,6 +394,7 @@ public final class Store {
             "APPENV_ID": registry.environments[i].id.uuidString,
             "APPENV_NAME": registry.environments[i].name
         ]
+        configuration.environment.merge(adapter.environment(data: launchData)) { _, isolated in isolated }
         let app = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         guard let launchedAt = app.launchDate, let executable = app.executableURL else {
             throw AppEnvError("The application did not provide a trackable instance.")
@@ -278,14 +404,12 @@ public final class Store {
         registry.environments[i].apps[j].instance = instance
         registry.environments[i].apps[j].lastVersion = version
         try save(registry)
-        let expected = data.appendingPathComponent(adapter == .chrome ? "profile" : "user-data")
-        for _ in 0..<40 {
+        for _ in 0..<(adapter == .codex ? 120 : 40) {
             try await Task.sleep(nanoseconds: 250_000_000)
             guard !app.isTerminated else { throw AppEnvError("The app exited during launch. Its profile may be locked by another process.") }
-            let marker = expected.appendingPathComponent(adapter == .chrome ? "Local State" : "User")
-            if app.isFinishedLaunching && matchesProfile(app.processIdentifier, adapter, data) && fm.fileExists(atPath: marker.path) { return instance }
+            if app.isFinishedLaunching && matchesProfile(app.processIdentifier, adapter, data) && adapter.readinessFiles(data: data).allSatisfy({ fm.fileExists(atPath: $0.path) }) { return instance }
         }
-        throw AppEnvError("The app is still tracked, but profile readiness was not confirmed within 10 seconds. Check its window before retrying.")
+        throw AppEnvError("The app is still tracked, but profile readiness was not confirmed within \(adapter == .codex ? 30 : 10) seconds. Check its window before retrying.")
     }
 
     @MainActor public func stop(_ selector: String, adapter: Adapter? = nil, force: Bool = false) async throws {
@@ -301,6 +425,7 @@ public final class Store {
         for _ in 0..<40 {
             reconcile(&registry)
             if !registry.environments[i].apps.contains(where: { (adapter == nil || $0.adapter == adapter) && $0.instance != nil }) {
+                try await stopCodexHelpers(targets, environmentID: registry.environments[i].id, force: force)
                 try save(registry); return
             }
             try await Task.sleep(nanoseconds: 250_000_000)

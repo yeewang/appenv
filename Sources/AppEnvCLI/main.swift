@@ -8,9 +8,9 @@ import Darwin
 
     appenv create NAME
     appenv list [--json]
-    appenv add --env NAME --app chrome|vscode [--path /path/App.app]
-    appenv run --env NAME --app chrome|vscode [--allow-version-change]
-    appenv stop NAME [--app chrome|vscode] [--force]
+    appenv add --env NAME --app chrome|vscode|codex [--path /path/App.app]
+    appenv run --env NAME --app chrome|vscode|codex [--allow-version-change]
+    appenv stop NAME [--app chrome|vscode|codex] [--force]
     appenv rename NAME NEW_NAME
     appenv duplicate NAME NEW_NAME
     appenv export NAME /absolute/path/backup.zip
@@ -51,7 +51,7 @@ import Darwin
             return name
         }
         func adapter() throws -> Adapter {
-            guard let name = options["--app"], let adapter = Adapter.resolve(name) else { throw AppEnvError("Specify --app chrome or --app vscode.") }
+            guard let name = options["--app"], let adapter = Adapter.resolve(name) else { throw AppEnvError("Specify --app chrome, --app vscode, or --app codex.") }
             return adapter
         }
         let allowed: [String: Set<String>] = [

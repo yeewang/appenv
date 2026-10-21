@@ -45,6 +45,17 @@ final class StoreTests: XCTestCase {
         XCTAssertNotEqual(source.id, copy.id)
     }
 
+    func testDuplicateOmitsRuntimePipesAndPreservesRegularFiles() throws {
+        let source = try store.create("runtime")
+        let sourceDirectory = store.directory(source.id)
+        let pipe = sourceDirectory.appendingPathComponent("runtime.pipe")
+        XCTAssertEqual(mkfifo(pipe.path, 0o600), 0)
+        try Data("persistent".utf8).write(to: sourceDirectory.appendingPathComponent("settings"))
+        let copy = try store.duplicate("runtime", name: "copy")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.directory(copy.id).appendingPathComponent("runtime.pipe").path))
+        XCTAssertEqual(try String(contentsOf: store.directory(copy.id).appendingPathComponent("settings")), "persistent")
+    }
+
     func testCorruptRegistryIsNotOverwritten() throws {
         let file = root.appendingPathComponent("registry.json")
         let corrupted = Data("invalid registry".utf8)
@@ -64,6 +75,68 @@ final class StoreTests: XCTestCase {
         _ = try store.create("test")
         XCTAssertThrowsError(try store.add("test", adapter: .chrome, url: URL(fileURLWithPath: "/System/Applications/TextEdit.app")))
         XCTAssertTrue(try store.environment("test").apps.isEmpty)
+    }
+
+    func testApplicationFilesAddToOnlyTheTargetAndDeduplicate() throws {
+        guard let chrome = Adapter.chrome.installedURL else { throw XCTSkip("Official Chrome is required for publisher validation.") }
+        _ = try store.create("source")
+        _ = try store.create("target")
+        XCTAssertEqual(try store.addApplicationFiles("target", urls: [chrome, chrome]), 1)
+        XCTAssertTrue(try store.environment("source").apps.isEmpty)
+        let env = try store.environment("target")
+        XCTAssertEqual(env.apps.count, 1)
+        XCTAssertEqual(env.apps[0].adapter, .chrome)
+        XCTAssertNil(env.apps[0].instance)
+        XCTAssertEqual(try store.addApplicationFiles("target", urls: [chrome]), 0)
+    }
+
+    func testMixedApplicationDropDoesNotPartiallyAddApps() throws {
+        guard let chrome = Adapter.chrome.installedURL else { throw XCTSkip("Official Chrome is required for publisher validation.") }
+        _ = try store.create("target")
+        XCTAssertThrowsError(try store.addApplicationFiles("target", urls: [chrome, root.appendingPathComponent("document.txt")]))
+        XCTAssertTrue(try store.environment("target").apps.isEmpty)
+    }
+
+    func testApplicationDropRejectsWebURLsAndUnsupportedApps() throws {
+        _ = try store.create("target")
+        XCTAssertThrowsError(try store.addApplicationFiles("target", urls: [URL(string: "https://example.com/Chrome.app")!]))
+        XCTAssertThrowsError(try store.addApplicationFiles("target", urls: [URL(fileURLWithPath: "/System/Applications/TextEdit.app")]))
+        XCTAssertTrue(try store.environment("target").apps.isEmpty)
+    }
+
+    func testCodexRequiresBothProfileVariablesForOwnership() throws {
+        let env = try store.create("codex")
+        let data = store.appDirectory(env.id, .codex)
+        let launchData = store.launchDirectory(.codex, data)
+        let arguments = Adapter.codex.arguments(data: launchData)
+        let environment = Adapter.codex.environment(data: launchData)
+        XCTAssertTrue(store.matchesProfile(arguments: arguments, environment: environment, adapter: .codex, data: data))
+        XCTAssertFalse(store.matchesProfile(arguments: arguments, environment: [:], adapter: .codex, data: data))
+        var wrongHome = environment
+        wrongHome["CODEX_HOME"] = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+        XCTAssertFalse(store.matchesProfile(arguments: arguments, environment: wrongHome, adapter: .codex, data: data))
+        XCTAssertFalse(store.matchesProfile(arguments: [], environment: environment, adapter: .codex, data: data))
+    }
+
+    func testCodexHomesAndDesktopDataAreDistinctAcrossEnvironments() throws {
+        let a = try store.create("a"), b = try store.create("b")
+        let first = store.launchDirectory(.codex, store.appDirectory(a.id, .codex))
+        let second = store.launchDirectory(.codex, store.appDirectory(b.id, .codex))
+        let one = Adapter.codex.environment(data: first), two = Adapter.codex.environment(data: second)
+        XCTAssertNotEqual(one["CODEX_HOME"], two["CODEX_HOME"])
+        XCTAssertNotEqual(one["CODEX_ELECTRON_USER_DATA_PATH"], two["CODEX_ELECTRON_USER_DATA_PATH"])
+        XCTAssertNotEqual(one["CODEX_HOME"], one["CODEX_ELECTRON_USER_DATA_PATH"])
+        XCTAssertTrue(Adapter.chrome.environment(data: first).isEmpty)
+        XCTAssertTrue(Adapter.vscode.environment(data: first).isEmpty)
+        XCTAssertEqual(Adapter.codex.readinessFiles(data: first).count, 2)
+    }
+
+    func testOfficialCodexCanBeAddedUnderItsInstalledName() throws {
+        guard let codex = Adapter.codex.installedURL else { throw XCTSkip("Official Codex installation required.") }
+        _ = try store.create("codex")
+        XCTAssertEqual(try store.addApplicationFiles("codex", urls: [codex]), 1)
+        XCTAssertEqual(try store.environment("codex").apps.first?.adapter, .codex)
+        XCTAssertEqual(Adapter.resolve("codex"), .codex)
     }
 
     func testVSCodeSocketPathRemainsShortForDeepStorageRoots() throws {

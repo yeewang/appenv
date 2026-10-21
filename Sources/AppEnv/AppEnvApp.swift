@@ -73,6 +73,76 @@ import UniformTypeIdentifiers
             busy = false; refresh()
         }
     }
+    func browseApps(_ environment: AppEnvCore.Environment) {
+        guard !busy else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Add to \(environment.name)"
+        panel.message = "Choose Chrome, VS Code, or Codex (also named ChatGPT in newer builds). You can also press ⇧⌘G to enter an application path."
+        guard panel.runModal() == .OK else { return }
+        addFiles(panel.urls, to: environment)
+    }
+    func addFiles(_ urls: [URL], to environment: AppEnvCore.Environment) {
+        guard !busy else { return }
+        do {
+            guard let store else { throw AppEnvError("Storage is unavailable.") }
+            let count = try store.addApplicationFiles(environment.id.uuidString, urls: urls)
+            selection = environment.id
+            status = count == 0 ? "Apps already added to \(environment.name)" : "Added \(count) app\(count == 1 ? "" : "s") to \(environment.name)"
+            refresh()
+        } catch { self.error = error.localizedDescription; status = "Adding apps needs attention" }
+    }
+    func acceptDrop(_ providers: [NSItemProvider], into environment: AppEnvCore.Environment) -> Bool {
+        guard !busy, !providers.isEmpty else { return false }
+        busy = true; status = "Reading dropped apps…"
+        Task {
+            do {
+                var urls: [URL] = []
+                for provider in providers {
+                    let url: URL = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                            if let error { continuation.resume(throwing: error); return }
+                            let url: URL?
+                            if let value = item as? URL { url = value }
+                            else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                            else if let string = item as? String { url = URL(string: string) }
+                            else { url = nil }
+                            guard let url, url.isFileURL else {
+                                continuation.resume(throwing: AppEnvError("Cannot read this drag. Drop an application from Finder.")); return
+                            }
+                            continuation.resume(returning: url)
+                        }
+                    }
+                    urls.append(url)
+                }
+                busy = false
+                addFiles(urls, to: environment)
+            } catch { busy = false; self.error = error.localizedDescription; status = "Drop needs attention" }
+        }
+        return true
+    }
+}
+
+private struct AppDropTarget: ViewModifier {
+    @ObservedObject var model: Model
+    let environment: AppEnvCore.Environment
+    @State private var targeted = false
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(targeted && !model.busy ? Color.accentColor : .clear, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .background(targeted && !model.busy ? Color.accentColor.opacity(0.08) : .clear)
+                    .allowsHitTesting(false)
+            }
+            .onDrop(of: [UTType.fileURL], isTargeted: $targeted) { providers in
+                model.acceptDrop(providers, into: environment)
+            }
+    }
 }
 
 @main struct AppEnvApp: App {
@@ -124,7 +194,10 @@ struct MainView: View {
                             }
                             Spacer()
                             if env.isRunning { Circle().fill(.green).frame(width: 7, height: 7) }
-                        }.padding(.vertical, 5).tag(env.id)
+                        }.padding(.vertical, 5)
+                            .modifier(AppDropTarget(model: model, environment: env))
+                            .help("Drop applications here to add them to \(env.name)")
+                            .tag(env.id)
                     }
                 }
             }
@@ -139,7 +212,7 @@ struct MainView: View {
                 ContentUnavailableView {
                     Label("Your apps, separate spaces", systemImage: "square.stack.3d.up")
                 } description: {
-                    Text("Create an environment for work, personal accounts, or testing. Run Chrome and VS Code in several environments at once.")
+                    Text("Create an environment for work, personal accounts, or testing. Run supported apps in several environments at once.")
                 } actions: {
                     Button("Create Environment") { name = ""; editor = .create }.buttonStyle(.borderedProminent)
                 }
@@ -221,26 +294,34 @@ struct MainView: View {
                 }.padding(14).frame(maxWidth: .infinity, alignment: .leading).background(.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
                 HStack {
                     Text("Applications").font(.title3.bold()); Spacer()
-                    if env.isRunning { Button("Stop All") { model.stop(env) } }
+                    if env.isRunning || env.apps.contains(where: { $0.adapter == .codex }) { Button("Stop All") { model.stop(env) } }
                     Menu {
+                        Button("Browse for Apps…") { model.browseApps(env) }
+                        Divider()
                         ForEach(Adapter.allCases) { adapter in
                             Button(adapter.name) { model.add(adapter, environment: env) }.disabled(env.apps.contains { $0.adapter == adapter })
                         }
                     } label: { Label("Add App", systemImage: "plus") }.fixedSize()
                 }
+                Label("Drag apps here or onto an environment. Or use Add App → Browse for Apps…", systemImage: "square.and.arrow.down")
+                    .font(.callout).foregroundStyle(.secondary)
                 if env.apps.isEmpty {
                     VStack(spacing: 12) {
                         Image(systemName: "app.dashed").font(.system(size: 38)).foregroundStyle(.secondary)
                         Text("Add your first app").font(.headline)
-                        Text("Chrome and VS Code have dedicated profile adapters.").foregroundStyle(.secondary)
+                        Text("Supports Chrome, VS Code, and Codex.").foregroundStyle(.secondary)
+                        Button("Browse for Apps…") { model.browseApps(env) }
                         HStack { ForEach(Adapter.allCases) { adapter in Button("Add \(adapter.name)") { model.add(adapter, environment: env) } } }
                     }.frame(maxWidth: .infinity).padding(.vertical, 38)
                 }
                 ForEach(env.apps) { app in
                     HStack(spacing: 14) {
                         Image(nsImage: NSWorkspace.shared.icon(forFile: app.path)).resizable().frame(width: 48, height: 48)
+                            .onDrag { NSItemProvider(object: URL(fileURLWithPath: app.path) as NSURL) }
+                            .help("Drag to another environment to add this app with a separate profile")
                         VStack(alignment: .leading, spacing: 5) {
                             Text(app.adapter.name).font(.headline)
+                            if app.adapter == .codex { Text("Separate local state · sign in within this environment").font(.caption).foregroundStyle(.secondary) }
                             Text(app.instance.map { "Running · PID \($0.pid)" } ?? "Stopped").font(.caption).foregroundStyle(app.instance == nil ? Color.secondary : Color.green)
                             if let version = app.lastVersion { Text("Last used version \(version)").font(.caption2).foregroundStyle(.secondary) }
                         }
@@ -250,7 +331,7 @@ struct MainView: View {
                         Menu {
                             Button("Choose App Location…") { model.add(app.adapter, environment: env, choose: true) }.disabled(app.instance != nil)
                             Button("Open Allowing Version Change…") { versionApp = app }.disabled(app.instance != nil)
-                            if app.instance != nil { Button("Force Stop…", role: .destructive) { forceAdapter = app.adapter } }
+                            if app.instance != nil || app.adapter == .codex { Button("Force Stop…", role: .destructive) { forceAdapter = app.adapter } }
                         } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 22)
                     }.padding(16).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))
                 }
@@ -258,5 +339,6 @@ struct MainView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(30)
         }
+        .modifier(AppDropTarget(model: model, environment: env))
     }
 }
