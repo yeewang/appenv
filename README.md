@@ -18,6 +18,10 @@ it is **not notarized or a distribution release**. Set `SIGN_IDENTITY` to a
 Developer ID identity to sign a release candidate; notarization is a separate step.
 Builds target the host architecture. The current artifact was tested on Apple silicon.
 
+Run `bash scripts/release.sh` to build a local DMG (app and optional CLI), an app ZIP,
+and SHA-256 checksums in `dist/releases`. The script verifies the disk image and
+the extracted app signature. These packages are not notarized automatically.
+
 ## Desktop use
 
 1. Create an environment, such as Work or Personal.

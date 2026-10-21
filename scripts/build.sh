@@ -5,6 +5,8 @@ swift build -c release
 BIN_DIR="$(swift build -c release --show-bin-path)"
 APP_DIR="$PWD/dist/AppEnv.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$PWD/dist/bin"
+bash scripts/build-icon.sh
+cp dist/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$BIN_DIR/AppEnvDesktop" "$APP_DIR/Contents/MacOS/AppEnv"
 cp "$BIN_DIR/appenv" "$PWD/dist/bin/appenv"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
@@ -15,6 +17,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>im.bots.appenv</string>
 <key>CFBundleName</key><string>AppEnv</string>
 <key>CFBundleDisplayName</key><string>AppEnv</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>CFBundleVersion</key><string>1</string>
