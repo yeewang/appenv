@@ -12,7 +12,10 @@ Requires macOS 14 or later and Xcode command-line tools with Swift 5.10 or newer
 open dist/AppEnv.app
 ```
 
-The build creates `dist/AppEnv.app` and `dist/bin/appenv`. Copy the app to your
+The build creates `dist/AppEnv.app` with the CLI at `Contents/MacOS/appenv`,
+plus a standalone copy at `dist/bin/appenv`. The CLI is signed before the enclosing
+app bundle. After installation, run `/Applications/AppEnv.app/Contents/MacOS/appenv --help`.
+Copy the app to your
 Applications folder if desired. The default build is signed ad hoc for local use;
 it is **not notarized or a distribution release**. Set `SIGN_IDENTITY` to a
 Developer ID identity to sign a release candidate; notarization is a separate step.
