@@ -145,10 +145,63 @@ private struct AppDropTarget: ViewModifier {
     }
 }
 
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var mainWindow: NSWindow?
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func track(_ window: NSWindow) {
+        guard mainWindow !== window else { return }
+        NotificationCenter.default.removeObserver(self)
+        mainWindow = window
+        NotificationCenter.default.addObserver(self, selector: #selector(windowClosed), name: NSWindow.willCloseNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(windowFocused), name: NSWindow.didBecomeKeyNotification, object: window)
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    @objc private func windowClosed(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    @objc private func windowFocused(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+    }
+}
+
+private struct MainWindowTracker: NSViewRepresentable {
+    let delegate: AppDelegate
+    func makeNSView(context: Context) -> TrackingView { TrackingView(delegate: delegate) }
+    func updateNSView(_ nsView: TrackingView, context: Context) {}
+
+    final class TrackingView: NSView {
+        let appDelegate: AppDelegate
+        init(delegate: AppDelegate) { appDelegate = delegate; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { appDelegate.track(window) }
+        }
+    }
+}
+
+private struct ShowAppEnvButton: View {
+    @SwiftUI.Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("Show AppEnv") {
+            NSApp.setActivationPolicy(.regular)
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+}
+
 @main struct AppEnvApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = Model()
     var body: some Scene {
-        WindowGroup("AppEnv") { MainView(model: model) }
+        Window("AppEnv", id: "main") {
+            MainView(model: model).background(MainWindowTracker(delegate: appDelegate))
+        }
             .defaultSize(width: 940, height: 620)
         MenuBarExtra("AppEnv", systemImage: "square.stack.3d.up") {
             ForEach(model.environments) { env in
@@ -160,10 +213,7 @@ private struct AppDropTarget: ViewModifier {
                 }
             }
             Divider()
-            Button("Show AppEnv") {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
-            }
+            ShowAppEnvButton()
             Button("Quit AppEnv") { NSApp.terminate(nil) }
         }
     }

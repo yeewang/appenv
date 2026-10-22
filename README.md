@@ -27,6 +27,10 @@ the extracted app signature. These packages are not notarized automatically.
 
 ## Desktop use
 
+Closing the AppEnv window keeps its menu bar controls running and hides its Dock
+icon. Choose **Show AppEnv** from the menu bar to reopen the window and restore
+the Dock icon. **Quit AppEnv** exits the manager.
+
 1. Create an environment, such as Work or Personal.
 2. Add Chrome, VS Code, or Codex using **Add App → Browse for Apps…**. The file picker
    supports multiple selections and **Shift-Command-G** to enter a path. You can
