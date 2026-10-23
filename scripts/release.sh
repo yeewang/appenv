@@ -21,13 +21,14 @@ AppEnv $VERSION for macOS 14 or newer ($ARCH)
 Drag AppEnv.app into Applications. The optional command-line tool is in bin.
 Each environment has separate supported app profiles. This is not a security sandbox.
 
-This local release is not notarized. Default builds use an ad-hoc signature.
+This release is not notarized. See SIGNING.txt for the actual signing identity.
 EOF
+codesign -dv --verbose=2 "$APP" > "$STAGE/SIGNING.txt" 2>&1
 ditto -c -k --sequesterRsrc --keepParent "$STAGE/AppEnv.app" "$OUT/$NAME.zip"
 hdiutil create -ov -volname "AppEnv $VERSION" -srcfolder "$STAGE" -format UDZO "$OUT/$NAME.dmg"
 hdiutil verify "$OUT/$NAME.dmg"
 ditto -x -k "$OUT/$NAME.zip" "$STAGE/verify"
-codesign --verify --strict "$STAGE/verify/AppEnv.app"
+codesign --verify --deep --strict "$STAGE/verify/AppEnv.app"
 codesign --verify --strict "$STAGE/bin/appenv"
 cd "$OUT"
 shasum -a 256 "$NAME.dmg" "$NAME.zip" > "$NAME.sha256"

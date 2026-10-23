@@ -351,7 +351,29 @@ public final class Store {
         return bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
     }
 
-    @MainActor @discardableResult public func launch(_ selector: String, adapter: Adapter, allowVersionChange: Bool = false) async throws -> Instance {
+    // Caller holds the registry lock. Save the backup before any updated app can launch.
+    @discardableResult func backupForVersionChange(_ source: Environment, registry: inout Registry) throws -> Environment {
+        try ensureStopped(source)
+        let prefix = String(source.name.prefix(40)) + " Backup"
+        var name = prefix
+        var suffix = 2
+        while registry.environments.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            name = "\(prefix) \(suffix)"; suffix += 1
+        }
+        let backup = Environment(name: try validateName(name, registry), apps: source.apps)
+        do {
+            try copyProfile(from: directory(source.id), to: directory(backup.id))
+            registry.environments.append(backup)
+            try save(registry)
+        } catch {
+            registry.environments.removeAll { $0.id == backup.id }
+            try? fm.removeItem(at: directory(backup.id))
+            throw error
+        }
+        return backup
+    }
+
+    @MainActor @discardableResult public func launch(_ selector: String, adapter: Adapter, allowVersionChange: Bool = false, backupBeforeVersionChange: Bool = false, approvedVersion: String? = nil) async throws -> Instance {
         let fd = try lock(); defer { unlock(fd) }
         var registry = try read(); reconcile(&registry)
         let i = try index(registry, selector)
@@ -365,8 +387,13 @@ public final class Store {
         if adapter == .codex { try await stopCodexHelpers([binding], environmentID: registry.environments[i].id, force: false) }
         let url = URL(fileURLWithPath: binding.path)
         let version = try validateApplication(adapter, url)
-        if let previous = binding.lastVersion, previous != version, !allowVersionChange {
-            throw AppEnvError("\(adapter.name) changed from \(previous) to \(version). Duplicate the stopped environment as a backup, then allow the version change to launch.")
+        if let previous = binding.lastVersion, previous != version {
+            guard (allowVersionChange || backupBeforeVersionChange), approvedVersion == nil || approvedVersion == version else {
+                throw AppVersionChange(environmentID: registry.environments[i].id, adapter: adapter, previous: previous, current: version)
+            }
+            if backupBeforeVersionChange {
+                try backupForVersionChange(registry.environments[i], registry: &registry)
+            }
         }
         let data = appDirectory(registry.environments[i].id, adapter)
         try fm.createDirectory(at: data, withIntermediateDirectories: true)

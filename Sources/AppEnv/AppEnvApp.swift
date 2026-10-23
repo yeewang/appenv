@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
     @Published var environments: [AppEnvCore.Environment] = []
     @Published var selection: UUID?
     @Published var error: String?
+    @Published var versionChange: AppVersionChange?
     @Published var busy = false
     @Published var status = "Ready"
     let store: Store?
@@ -30,16 +31,25 @@ import UniformTypeIdentifiers
         guard !busy else { return }
         do { try action(); status = label; refresh() } catch { self.error = error.localizedDescription }
     }
-    func launch(_ environment: AppEnvCore.Environment, _ app: AppBinding, allowVersionChange: Bool = false) {
+    func launch(_ environment: AppEnvCore.Environment, _ app: AppBinding, allowVersionChange: Bool = false, backup: Bool = false, approvedVersion: String? = nil) {
         guard !busy, let store else { return }
         busy = true; status = "Opening \(app.adapter.name)…"
         Task {
             do {
-                _ = try await store.launch(environment.id.uuidString, adapter: app.adapter, allowVersionChange: allowVersionChange)
+                _ = try await store.launch(environment.id.uuidString, adapter: app.adapter, allowVersionChange: allowVersionChange, backupBeforeVersionChange: backup, approvedVersion: approvedVersion)
                 status = "Opened \(app.adapter.name) in \(environment.name)"
+            } catch let change as AppVersionChange {
+                versionChange = change
+                status = "App update needs approval"
             } catch { self.error = error.localizedDescription; status = "Launch needs attention" }
             busy = false; refresh()
         }
+    }
+    func resolveVersionChange(_ change: AppVersionChange, backup: Bool) {
+        guard let env = environments.first(where: { $0.id == change.environmentID }),
+              let app = env.apps.first(where: { $0.adapter == change.adapter }) else { return }
+        versionChange = nil
+        launch(env, app, allowVersionChange: true, backup: backup, approvedVersion: change.current)
     }
     func stop(_ environment: AppEnvCore.Environment, adapter: Adapter? = nil, force: Bool = false) {
         guard !busy, let store else { return }
@@ -185,13 +195,18 @@ private struct MainWindowTracker: NSViewRepresentable {
 }
 
 private struct ShowAppEnvButton: View {
+    @ObservedObject var model: Model
     @SwiftUI.Environment(\.openWindow) private var openWindow
     var body: some View {
         Button("Show AppEnv") {
-            NSApp.setActivationPolicy(.regular)
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
+            show()
         }
+        .onChange(of: model.versionChange != nil) { _, pending in if pending { show() } }
+    }
+    private func show() {
+        NSApp.setActivationPolicy(.regular)
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -213,7 +228,7 @@ private struct ShowAppEnvButton: View {
                 }
             }
             Divider()
-            ShowAppEnvButton()
+            ShowAppEnvButton(model: model)
             Button("Quit AppEnv") { NSApp.terminate(nil) }
         }
     }
@@ -225,7 +240,6 @@ struct MainView: View {
     @State private var name = ""
     @State private var confirmDelete = false
     @State private var forceAdapter: Adapter?
-    @State private var versionApp: AppBinding?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     enum Editor: String, Identifiable { case create = "New Environment", rename = "Rename Environment", duplicate = "Duplicate Environment"; var id: String { rawValue } }
 
@@ -302,11 +316,13 @@ struct MainView: View {
                 if let env = model.selected, let adapter = forceAdapter { model.stop(env, adapter: adapter, force: true) }; forceAdapter = nil
             }
         }
-        .confirmationDialog("Allow this app version to use the profile?", isPresented: Binding(get: { versionApp != nil }, set: { if !$0 { versionApp = nil } }), titleVisibility: .visible) {
-            Button("Allow and Open") {
-                if let env = model.selected, let app = versionApp { model.launch(env, app, allowVersionChange: true) }; versionApp = nil
-            }
-        } message: { Text("App updates may migrate profile data. Duplicate the stopped environment first if you need a backup.") }
+        .alert("App update detected", isPresented: Binding(get: { model.versionChange != nil }, set: { if !$0 { model.versionChange = nil } }), presenting: model.versionChange) { change in
+            Button("Back Up and Open") { model.resolveVersionChange(change, backup: true) }
+            Button("Open Without Backup", role: .destructive) { model.resolveVersionChange(change, backup: false) }
+            Button("Cancel", role: .cancel) { model.versionChange = nil }
+        } message: { change in
+            Text("\(change.adapter.name) changed from \(change.previous) to \(change.current). Back Up and Open duplicates the entire environment before launching. Stop all apps in this environment first. The backup keeps the old profile data, not the old application version.")
+        }
     }
     private func saveName(_ mode: Editor) {
         model.perform("Environment saved") {
@@ -380,7 +396,6 @@ struct MainView: View {
                         Button(app.instance == nil ? "Open" : "Focus") { model.launch(env, app) }.buttonStyle(.borderedProminent)
                         Menu {
                             Button("Choose App Location…") { model.add(app.adapter, environment: env, choose: true) }.disabled(app.instance != nil)
-                            Button("Open Allowing Version Change…") { versionApp = app }.disabled(app.instance != nil)
                             if app.instance != nil || app.adapter == .codex { Button("Force Stop…", role: .destructive) { forceAdapter = app.adapter } }
                         } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 22)
                     }.padding(16).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 14))

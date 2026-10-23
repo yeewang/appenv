@@ -45,6 +45,54 @@ final class StoreTests: XCTestCase {
         XCTAssertNotEqual(source.id, copy.id)
     }
 
+    func testVersionBackupPersistsOldVersionAndIndependentProfile() throws {
+        var binding = AppBinding(adapter: .codex, path: "/Applications/Codex.app")
+        binding.lastVersion = "26.1013.40934"
+        let source = Environment(name: "Work", apps: [binding])
+        try FileManager.default.createDirectory(at: store.directory(source.id), withIntermediateDirectories: true)
+        let file = store.directory(source.id).appendingPathComponent("settings")
+        try Data("old-profile".utf8).write(to: file)
+        var registry = Registry(environments: [source])
+        let backup = try store.backupForVersionChange(source, registry: &registry)
+        try Data("migrated-profile".utf8).write(to: file)
+        XCTAssertEqual(try String(contentsOf: store.directory(backup.id).appendingPathComponent("settings")), "old-profile")
+        XCTAssertEqual(backup.apps.first?.lastVersion, "26.1013.40934")
+        XCTAssertEqual(try Store(root: root).list().count, 2)
+        let second = try store.backupForVersionChange(source, registry: &registry)
+        XCTAssertEqual(second.name, "Work Backup 2")
+    }
+
+    func testFailedVersionBackupDoesNotRegisterPartialCopy() throws {
+        let source = Environment(name: "Missing")
+        var registry = Registry(environments: [source])
+        XCTAssertThrowsError(try store.backupForVersionChange(source, registry: &registry))
+        XCTAssertEqual(registry.environments.count, 1)
+        XCTAssertTrue(try store.list().isEmpty)
+    }
+
+    @MainActor func testVersionChangeRequiresApprovalForTheCurrentVersion() async throws {
+        guard let url = Adapter.codex.installedURL else { throw XCTSkip("Codex is not installed") }
+        let env = try store.create("Update Test")
+        try store.add(env.id.uuidString, adapter: .codex, url: url)
+        let registryURL = root.appendingPathComponent("registry.json")
+        var registry = try JSONDecoder().decode(Registry.self, from: Data(contentsOf: registryURL))
+        registry.environments[0].apps[0].lastVersion = "old-test-version"
+        try JSONEncoder().encode(registry).write(to: registryURL)
+        for approved in [nil, "outdated-approval"] as [String?] {
+            do {
+                _ = try await store.launch(env.id.uuidString, adapter: .codex,
+                                           backupBeforeVersionChange: approved != nil, approvedVersion: approved)
+                XCTFail("Must reject unapproved version before launch")
+            } catch let change as AppVersionChange {
+                XCTAssertEqual(change.environmentID, env.id)
+                XCTAssertEqual(change.previous, "old-test-version")
+                XCTAssertNotEqual(change.current, "outdated-approval")
+            }
+        }
+        XCTAssertEqual(try store.list().count, 1)
+        XCTAssertNil(try store.environment(env.id.uuidString).apps[0].instance)
+    }
+
     func testDuplicateOmitsRuntimePipesAndPreservesRegularFiles() throws {
         let source = try store.create("runtime")
         let sourceDirectory = store.directory(source.id)

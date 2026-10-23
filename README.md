@@ -27,6 +27,13 @@ the extracted app signature. These packages are not notarized automatically.
 
 ## Desktop use
 
+When an installed app updates, opening it shows the old and new versions. Choose
+**Back Up and Open** to duplicate the stopped environment and then launch the update.
+All apps in that environment must be stopped first. Backups appear as separate
+environments named `Work Backup`, `Work Backup 2`, etc. Copy failures prevent launch;
+successful backups remain available even if launch fails. Backups preserve profile
+data, not the previous app executable. **Open Without Backup** is an explicit override.
+
 Closing the AppEnv window keeps its menu bar controls running and hides its Dock
 icon. Choose **Show AppEnv** from the menu bar to reopen the window and restore
 the Dock icon. **Quit AppEnv** exits the manager.

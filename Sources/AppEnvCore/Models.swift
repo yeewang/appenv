@@ -84,3 +84,13 @@ struct Registry: Codable {
     var schemaVersion = 1
     var environments: [Environment] = []
 }
+
+public struct AppVersionChange: LocalizedError {
+    public let environmentID: UUID
+    public let adapter: Adapter
+    public let previous: String
+    public let current: String
+    public var errorDescription: String? {
+        "\(adapter.name) changed from \(previous) to \(current). Back up the stopped environment before opening the updated app."
+    }
+}
